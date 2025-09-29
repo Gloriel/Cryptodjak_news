@@ -1,2 +1,0 @@
-2025-06-23 18:32:58,180 - __main__ - ERROR - Ошибка загрузки CSV: [Errno 2] No such file or directory: 'questions_crypto.csv'
-2025-06-23 18:32:58,180 - __main__ - ERROR - Критическая ошибка: [Errno 2] No such file or directory: 'questions_crypto.csv'
