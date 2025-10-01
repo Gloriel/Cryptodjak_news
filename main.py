@@ -5,9 +5,10 @@ import logging
 import hashlib
 import re
 import html
+import signal
 from typing import Optional, Dict, Any, List, Set, Tuple
 from datetime import datetime, timedelta, timezone
-from time import mktime
+from calendar import timegm
 
 import aiohttp
 import feedparser
@@ -57,8 +58,11 @@ class CryptoNewsBot:
                 missing.append("CHANNEL_ID")
             raise ValueError(f"Отсутствуют переменные окружения: {', '.join(missing)}")
 
-        # Стартовый пул русскоязычных лент
-        self.rss_feeds: List[str] = [
+        if not self.channel_id.lstrip('-').isdigit():
+            raise ValueError("CHANNEL_ID должен быть целым числом (например, -1001234567890)")
+
+        # RSS-ленты (очищены от пробелов)
+        raw_feeds = [
             "https://ru.cointelegraph.com/feed/",
             "https://cryptodirectories.com/ru/blog/feed/",
             "https://coinspot.io/feed/",
@@ -72,27 +76,30 @@ class CryptoNewsBot:
             "https://cryptorussia.ru/feed/",
             "https://bitcoinist.ru/feed/",
         ]
+        self.rss_feeds: List[str] = [url.strip() for url in raw_feeds if url.strip()]
 
         self.bot = Bot(token=self.bot_token)
         self.session: Optional[aiohttp.ClientSession] = None
 
-        # Частоты
-        self.check_interval = 15 * 60       # каждые 15 минут опрос лент
-        self.post_interval = 60 * 60        # минимум 1 час между постами
-        self.request_timeout = 20
+        # Настройки из .env или по умолчанию
+        self.max_posts_per_day = int(os.getenv("MAX_POSTS_PER_DAY", "5"))
+        self.check_interval = int(os.getenv("CHECK_INTERVAL_MIN", "15")) * 60
+        self.post_interval = int(os.getenv("POST_INTERVAL_MIN", "60")) * 60
+        self.request_timeout = int(os.getenv("REQUEST_TIMEOUT", "20"))
 
-        # Лимиты/состояние
-        self.max_posts_per_day = 5
+        # Состояние
         self.posts_today = 0
         self.last_reset_date = datetime.now().date()
         self.last_post_time: Optional[datetime] = None
 
-        # Учёт и статус лент
-        self.sent_news: Set[str] = set()  # хэши отправленных
+        # Кэш отправленных новостей с TTL (7 дней)
+        self.sent_news: Dict[str, datetime] = {}  # id -> timestamp
+        self.ttl_days = 7
+
+        # Статистика и карантин
         self.feed_usage: Dict[str, int] = {f: 0 for f in self.rss_feeds}
         self.feed_errors: Dict[str, int] = {f: 0 for f in self.rss_feeds}
-        self.feed_quarantine_until: Dict[str, datetime] = {}  # когда можно снова пробовать ленту
-
+        self.feed_quarantine_until: Dict[str, datetime] = {}
         self.stats = {
             "total_posts": 0,
             "failed_posts": 0,
@@ -107,7 +114,7 @@ class CryptoNewsBot:
         self.session = aiohttp.ClientSession(
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
             },
             timeout=aiohttp.ClientTimeout(total=self.request_timeout),
@@ -126,14 +133,13 @@ class CryptoNewsBot:
         return ''.join(ch for ch in text if ch.isalnum())
 
     def _is_russian_text(self, text: str) -> bool:
-        """Текст считается русским, если ≥ 30% кириллицы среди букв/цифр."""
         if not text:
             return False
         core = self._letters_and_digits(text)
         if not core:
             return False
         russian = re.findall(r'[а-яА-ЯёЁ]', core)
-        return (len(russian) / max(1, len(core))) >= 0.30
+        return (len(russian) / len(core)) >= 0.30
 
     @staticmethod
     def _clean_text(text: str, max_length: int = 600) -> str:
@@ -151,7 +157,7 @@ class CryptoNewsBot:
 
     @staticmethod
     def _escape_html(text: str) -> str:
-        return html.escape(text or "")
+        return html.escape(text or "", quote=False)
 
     @staticmethod
     def _domain_of(url: str) -> str:
@@ -189,7 +195,7 @@ class CryptoNewsBot:
 
     @staticmethod
     def _parse_date(entry: Dict[str, Any]) -> Optional[datetime]:
-        """Получаем дату публикации как naive-local datetime."""
+        """Возвращает naive datetime в локальной зоне."""
         tm = None
         if 'published_parsed' in entry and entry['published_parsed']:
             tm = entry['published_parsed']
@@ -198,15 +204,23 @@ class CryptoNewsBot:
 
         if tm:
             try:
-                # mktime возвращает localtime; делаем naive в локальной зоне
-                return datetime.fromtimestamp(mktime(tm))
+                # feedparser даёт struct_time в UTC → конвертируем правильно
+                dt_utc = datetime.fromtimestamp(timegm(tm), tz=timezone.utc)
+                return dt_utc.astimezone().replace(tzinfo=None)
             except Exception:
                 pass
         return None
 
+    def _clean_sent_news_cache(self):
+        cutoff = datetime.now() - timedelta(days=self.ttl_days)
+        before = len(self.sent_news)
+        self.sent_news = {k: v for k, v in self.sent_news.items() if v > cutoff}
+        after = len(self.sent_news)
+        if before != after:
+            logger.info(f"Очищен кэш отправленных новостей: {before} → {after}")
+
     # ---------- ПРОГРЕВ ----------
     async def test_rss_feeds(self) -> List[str]:
-        """Проверяем ленты и берём только те, где есть русские записи."""
         logger.info("Тестируем RSS-ленты…")
         ok: List[str] = []
         for url in self.rss_feeds:
@@ -225,26 +239,17 @@ class CryptoNewsBot:
                         logger.warning(f"⚠️ {url} — записей мало/нет русских")
             except Exception as e:
                 logger.warning(f"❌ {url} — ошибка: {e!r}")
-        logger.info(f"Готовы: {len(ok)}/{len(self.rss_feeds)}")
         return ok
 
     # ---------- ВЫБОР ЛЕНТЫ ----------
     def _eligible_feeds(self) -> List[str]:
         now = datetime.now()
-        eligible = []
-        for f in self.rss_feeds:
-            until = self.feed_quarantine_until.get(f)
-            if until and now < until:
-                # ещё в карантине
-                continue
-            eligible.append(f)
-        return eligible
+        return [f for f in self.rss_feeds if not (self.feed_quarantine_until.get(f) and now < self.feed_quarantine_until[f])]
 
     def _get_next_feed(self) -> Optional[str]:
         eligible = self._eligible_feeds()
         if not eligible:
             return None
-        # брать ту, что реже всего использовалась
         min_usage = min(self.feed_usage.get(f, 0) for f in eligible)
         candidates = [f for f in eligible if self.feed_usage.get(f, 0) == min_usage]
         import random
@@ -254,10 +259,8 @@ class CryptoNewsBot:
         return chosen
 
     def _quarantine_feed(self, feed: str):
-        """Экспоненциальный бэкофф для ленты."""
         self.feed_errors[feed] = self.feed_errors.get(feed, 0) + 1
         tries = self.feed_errors[feed]
-        # 10мин, 30мин, 1ч, 2ч, 4ч…
         backoff_minutes = min(240, int(10 * (1.5 ** (tries - 1))))
         until = datetime.now() + timedelta(minutes=backoff_minutes)
         self.feed_quarantine_until[feed] = until
@@ -301,7 +304,7 @@ class CryptoNewsBot:
                     if nid in self.sent_news:
                         continue
 
-                    pub_dt = self._parse_date(entry)  # может быть None
+                    pub_dt = self._parse_date(entry)
                     description = self._clean_text(desc_raw, 450)
 
                     collected.append({
@@ -314,7 +317,6 @@ class CryptoNewsBot:
                         "domain": self._domain_of(link) or self._domain_of(rss_url),
                     })
 
-                # сортируем: свежие выше, затем длина описания (чуть богаче контент)
                 collected.sort(key=lambda x: (
                     0 if x["published"] else 1,
                     -(x["published"].timestamp() if x["published"] else 0),
@@ -327,7 +329,6 @@ class CryptoNewsBot:
                 else:
                     logger.info(f"Подходящих новостей в {rss_url} не найдено")
 
-                # берём не больше трёх — не спамим
                 return collected[:3]
 
         except Exception as e:
@@ -339,31 +340,23 @@ class CryptoNewsBot:
     def _format_time_line(self, published: Optional[datetime], domain: str) -> str:
         parts = []
         if published:
-            # показываем локальную дату/время кратко
             parts.append(published.strftime("%d %b %Y, %H:%M"))
         if domain:
             parts.append(domain)
-        if not parts:
-            return ""
-        return " • ".join(parts)
+        return " • ".join(parts) if parts else ""
 
     def prepare_post(self, item: Dict[str, Any]) -> Dict[str, Any]:
         title_html = self._escape_html(item['title'])
         desc_html = self._escape_html(item['description'])
-        link = item['link']
+        safe_link = html.escape(item['link'], quote=True)
         meta_line = self._format_time_line(item.get("published"), item.get("domain", ""))
 
-        # компактный, но «цепляющий» формат:
-        # <b>Заголовок</b>
-        # 🕒 дата • источник
-        # краткое описание
-        # Читать далее → (кликабельно)
         message_lines = [f"<b>{title_html}</b>"]
         if meta_line:
             message_lines.append(f"🕒 {self._escape_html(meta_line)}")
         if desc_html:
             message_lines.append(desc_html)
-        message_lines.append(f'<a href="{link}">Читать далее →</a>')
+        message_lines.append(f'<a href="{safe_link}">Читать далее →</a>')
 
         message = "\n\n".join(message_lines)
 
@@ -384,22 +377,22 @@ class CryptoNewsBot:
                     chat_id=self.channel_id,
                     text=post['message'],
                     parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False,
+                    disable_web_page_preview=True,  # 🔒 запретить превью
                 )
-                # учёт
+                now = datetime.now()
                 self.posts_today += 1
                 self.stats['total_posts'] += 1
-                self.stats['last_success'] = datetime.now()
+                self.stats['last_success'] = now
                 self.stats['feed_stats'][post['source']] += 1
-                self.sent_news.add(post['id'])
-                self.last_post_time = datetime.now()
+                self.sent_news[post['id']] = now
+                self.last_post_time = now
 
                 logger.info(f"✅ Отправлено: {post['title'][:70]}… ({self.posts_today}/{self.max_posts_per_day} сегодня)")
                 return True
 
             except RetryAfter as e:
                 wait = int(getattr(e, "retry_after", delay))
-                logger.warning(f"FloodWait/RetryAfter: ждём {wait} сек")
+                logger.warning(f"FloodWait: ждём {wait} сек")
                 await asyncio.sleep(wait)
             except (TimedOut, NetworkError) as e:
                 logger.warning(f"Сеть (попытка {attempt}/{max_attempts}): {e}. Ждём {delay} сек")
@@ -419,28 +412,22 @@ class CryptoNewsBot:
     async def run(self) -> None:
         await self.initialize()
         try:
-            # 1) Прогрев: берём только рабочие ленты
             working_feeds = await self.test_rss_feeds()
             if not working_feeds:
-                logger.error("Ни одна RSS-лента не прошла тест. Проверьте источники.")
+                logger.error("Ни одна RSS-лента не прошла тест.")
                 return
 
-            # используем только прошедшие тест ленты
             self.rss_feeds = list(working_feeds)
-            # пересобираем карты статуса под новый пул
             self.feed_usage = {f: 0 for f in self.rss_feeds}
             self.feed_errors = {f: 0 for f in self.rss_feeds}
             self.feed_quarantine_until = {}
             self.stats["feed_stats"] = {f: 0 for f in self.rss_feeds}
 
-            logger.info(f"Работаем только с прошедшими тест лентами: {len(self.rss_feeds)} шт.")
-            logger.info("Бот запущен ✅")
-            logger.info(f"Лимит: {self.max_posts_per_day}/сутки, пауза между постами: {self.post_interval // 60} мин")
+            logger.info(f"Работаем с {len(self.rss_feeds)} лентами")
+            logger.info(f"Лимит: {self.max_posts_per_day}/сутки, пауза: {self.post_interval // 60} мин")
 
-            # 2) Главный цикл
             while True:
                 try:
-                    # дневной лимит
                     self._reset_daily_if_needed()
                     if self.posts_today >= self.max_posts_per_day:
                         tomorrow = datetime.combine(datetime.now().date() + timedelta(days=1), datetime.min.time())
@@ -449,18 +436,15 @@ class CryptoNewsBot:
                         await asyncio.sleep(sleep_s)
                         continue
 
-                    # интервал между постами
                     wait = self._seconds_until_next_post()
                     if wait > 0:
                         nap = min(wait, max(300, self.check_interval))
-                        logger.info(f"Рано постить. Ждём {nap // 60} мин")
+                        logger.debug(f"Рано постить. Ждём {nap // 60} мин")
                         await asyncio.sleep(nap)
                         continue
 
-                    # берём ленту
                     feed = self._get_next_feed()
                     if not feed:
-                        # все ленты в карантине; ждём до ближайшего выхода из карантина
                         if self.feed_quarantine_until:
                             nearest = min(self.feed_quarantine_until.values())
                             sleep_s = max(60, int((nearest - datetime.now()).total_seconds()))
@@ -475,24 +459,20 @@ class CryptoNewsBot:
                         await asyncio.sleep(self.check_interval)
                         continue
 
-                    # выбираем лучшую (самая свежая/информативная)
                     best = news[0]
                     post = self.prepare_post(best)
                     ok = await self.send_post(post)
 
                     if ok:
-                        # публиковали — ждём либо check_interval, либо до следующего окна (что меньше)
                         await asyncio.sleep(min(self.check_interval, self.post_interval))
                     else:
                         await asyncio.sleep(15 * 60)
 
-                    # санитарная очистка кэша
-                    if len(self.sent_news) > 1000:
-                        self.sent_news = set(list(self.sent_news)[-500:])
-                        logger.info("Очищен кэш отправленных новостей")
+                    # Регулярная очистка кэша
+                    self._clean_sent_news_cache()
 
                     active_total = len(self._eligible_feeds())
-                    logger.info(f"Статистика: {self.posts_today}/{self.max_posts_per_day} сегодня, доступных лент: {active_total}/{len(self.rss_feeds)}")
+                    logger.debug(f"Статистика: {self.posts_today}/{self.max_posts_per_day}, активных лент: {active_total}/{len(self.rss_feeds)}")
 
                 except asyncio.CancelledError:
                     raise
@@ -508,6 +488,13 @@ class CryptoNewsBot:
 # ========= ENTRY =========
 async def main():
     bot = CryptoNewsBot()
+
+    # Graceful shutdown via signals (Unix only)
+    if os.name != 'nt':
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(bot)))
+
     try:
         await bot.run()
     except KeyboardInterrupt:
@@ -518,8 +505,12 @@ async def main():
         logger.info("Выход")
 
 
+async def shutdown(bot: CryptoNewsBot):
+    logger.info("Получен сигнал завершения. Завершаем работу...")
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
-    # Для Windows-консоли
     if os.name == 'nt':
         try:
             sys.stdout.reconfigure(encoding='utf-8')
