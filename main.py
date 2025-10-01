@@ -15,7 +15,9 @@ import feedparser
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
+# Ошибки теперь в другом месте:
+from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram.error import BadRequest  # остаётся там же
 
 
 # ========= ЛОГИ =========
